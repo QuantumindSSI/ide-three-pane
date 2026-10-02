@@ -6,10 +6,18 @@
 #   bin/ide, ide-focus, ide-mouse   -> $BIN_DIR        (default ~/.local/bin)
 #   config/tmux.conf                -> ~/.tmux.conf
 #   config/nvim/init.lua            -> ~/.config/nvim/init.lua
+#   docs/neovim-guide.md            -> ~/.local/share/ide-three-pane/docs/
 #   opencode/                       -> ~/.config/opencode/
 #     opencode.jsonc is generated here, with machine-specific MCP and
 #     provider blocks included only when their prerequisites exist.
 #     skills/ and maintenance/ are copied as-is.
+#
+# Harness detection: installed agent harnesses (opencode, omp, hermes,
+# claude, codex, gemini, aider, crush, goose) and editors (nvim, vim, helix,
+# emacs, nano, micro) are detected, reported, and offered for the three
+# panes. Interactive runs ask which to use and write the choices to
+# ~/.config/ide/config as defaults for the ide launcher; non-interactive
+# runs honour --editor/--top/--bottom and otherwise skip.
 #
 # Options:
 #   --bin-dir DIR   install the bin scripts into DIR (default ~/.local/bin)
@@ -19,6 +27,10 @@
 #   --no-nvim       skip the nvim config
 #   --no-tmux       skip the tmux config
 #   --no-path       never touch any shell rc file
+#   --no-pick       skip the interactive pane selection (flags still apply)
+#   --editor SPEC   default for the left pane, e.g. "nvim" or "hx ."
+#   --top SPEC      default for the top-right pane, e.g. "opencode"
+#   --bottom SPEC   default for the bottom-right pane, e.g. "hermes"
 #   -h | --help     this message
 #
 # Existing files that differ are backed up to
@@ -34,16 +46,23 @@ DO_OPENCODE=1
 DO_NVIM=1
 DO_TMUX=1
 DO_PATH=1
+DO_PICK=1
+EDITOR_SPEC=""
+TOP_SPEC=""
+BOTTOM_SPEC=""
 STAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/ide-three-pane/backups/$STAMP"
 
 SOURCE_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 OPENCODE_DIR="$HOME/.config/opencode"
 NVIM_DIR="$HOME/.config/nvim"
+GUIDE_DIR="$HOME/.local/share/ide-three-pane/docs"
+IDE_CONFIG_DIR="$HOME/.config/ide"
+IDE_CONFIG_FILE="$IDE_CONFIG_DIR/config"
 TMP_JSON=""
 
 usage() {
-  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 cleanup() {
@@ -141,6 +160,181 @@ add_to_path() {
   echo "install: appended PATH entry to $rc (open a new shell to pick it up)"
 }
 
+# ------------------------------------------------- harness and editor menus
+
+editors() {
+  printf '%s\n' \
+    'nvim|nvim .' \
+    'vim|vim .' \
+    'helix|hx .' \
+    'emacs|emacs -nw .' \
+    'nano|nano .' \
+    'micro|micro .'
+}
+
+harnesses() {
+  printf '%s\n' \
+    'opencode|opencode' \
+    'omp|omp' \
+    'hermes|hermes' \
+    'claude|claude' \
+    'codex|codex' \
+    'gemini|gemini' \
+    'aider|aider' \
+    'crush|crush' \
+    'goose|goose'
+}
+
+# resolve_spec SPEC editor|harness: fail unless SPEC is a catalog name or a
+# command whose binary exists.
+resolve_spec() {
+  local spec="$1" kind="$2" catalog line base
+  if [ "$kind" = editor ]; then catalog=$(editors); else catalog=$(harnesses); fi
+  line=$(printf '%s\n' "$catalog" | awk -F'|' -v s="$spec" '$1 == s { print; exit }')
+  if [ -n "$line" ]; then
+    base=$(printf '%s' "$line" | cut -d'|' -f2- | awk '{ print $1 }')
+    if ! command -v "$base" >/dev/null 2>&1; then
+      echo "install: $kind '$spec' needs '$base', which is not installed." >&2
+      return 1
+    fi
+    return 0
+  fi
+  base=$(printf '%s' "$spec" | awk '{ print $1 }')
+  if [ -z "$base" ]; then
+    echo "install: empty $kind command." >&2
+    return 1
+  fi
+  if ! command -v "$base" >/dev/null 2>&1; then
+    echo "install: $kind '$spec' needs '$base', which is not installed." >&2
+    return 1
+  fi
+}
+
+# ready_harnesses NAME...: print the catalog entries whose binary exists.
+ready_harnesses() {
+  local catalog="$1" line name cmd base
+  printf '%s\n' "$catalog" | while IFS='|' read -r name cmd; do
+    [ -n "$name" ] || continue
+    base=$(printf '%s' "$cmd" | awk '{ print $1 }')
+    if command -v "$base" >/dev/null 2>&1; then
+      printf '%s ' "$name"
+    fi
+  done
+}
+
+# prompt_slot KIND TITLE DEFAULT_SPEC: interactive menu over the catalog.
+# Installed tools are marked; a pick of a missing tool is rejected. Prints
+# the chosen SPEC (catalog name or custom command) on stdout. Enter keeps
+# the default; c) enters a custom command; EOF returns 2 (cancel).
+prompt_slot() {
+  local kind="$1" title="$2" default_spec="$3"
+  local catalog line name cmd base i ans count
+  if [ "$kind" = editor ]; then catalog=$(editors); else catalog=$(harnesses); fi
+  echo "" >&2
+  echo "$title (current default: ${default_spec:-none}):" >&2
+  i=0
+  while IFS='|' read -r name cmd; do
+    [ -n "$name" ] || continue
+    i=$((i + 1))
+    base=$(printf '%s' "$cmd" | awk '{ print $1 }')
+    if command -v "$base" >/dev/null 2>&1; then
+      printf '  %2d  %-9s %-16s installed\n' "$i" "$name" "$cmd" >&2
+    else
+      printf '  %2d  %-9s %-16s not installed\n' "$i" "$name" "$cmd" >&2
+    fi
+  done <<EOF
+$catalog
+EOF
+  printf '  c) custom command\n' >&2
+  printf 'choice [number, c, or Enter for %s]> ' "${default_spec:-nothing}" >&2
+  read -r ans || return 2
+  case "$ans" in
+    '')
+      printf '%s\n' "$default_spec"
+      return 0
+      ;;
+    c | C)
+      printf 'command> ' >&2
+      read -r ans || return 2
+      base=$(printf '%s' "$ans" | awk '{ print $1 }')
+      if [ -z "$base" ] || ! command -v "$base" >/dev/null 2>&1; then
+        echo "install: '$base' is not installed." >&2
+        return 1
+      fi
+      printf '%s\n' "$ans"
+      return 0
+      ;;
+    *[!0-9]*)
+      echo "install: answer with a number, c, or Enter." >&2
+      return 1
+      ;;
+  esac
+  count=$(printf '%s\n' "$catalog" | grep -c .)
+  if [ "$ans" -lt 1 ] || [ "$ans" -gt "$count" ]; then
+    echo "install: no entry $ans (1 to $count)." >&2
+    return 1
+  fi
+  line=$(printf '%s\n' "$catalog" | sed -n "${ans}p")
+  base=$(printf '%s' "$line" | cut -d'|' -f2- | awk '{ print $1 }')
+  if ! command -v "$base" >/dev/null 2>&1; then
+    echo "install: $base is not installed; pick an installed tool or c for custom." >&2
+    return 1
+  fi
+  printf '%s\n' "$(printf '%s' "$line" | cut -d'|' -f1)"
+}
+
+# set_ide_config KEY VALUE: store a pane default in the ide launcher's
+# global config, preserving every other line already there. The ide launcher
+# precedence is: flag > env > this file > builtins.
+set_ide_config() {
+  local key="$1" value="$2" tmp
+  mkdir -p "$IDE_CONFIG_DIR"
+  tmp="$IDE_CONFIG_DIR/.config.tmp.$$"
+  if [ -f "$IDE_CONFIG_FILE" ]; then
+    awk -F= -v k="$key" '$1 != k' "$IDE_CONFIG_FILE" > "$tmp"
+  else
+    : > "$tmp"
+  fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  mv "$tmp" "$IDE_CONFIG_FILE"
+  echo "install: pane default $key=$value written to $IDE_CONFIG_FILE"
+}
+
+# choose_defaults: detect installed tools, report them, then honour flags or
+# prompt per pane (only when stdin is a terminal and --no-pick was not
+# given). Returns 2 when the user cancelled mid-prompt.
+choose_defaults() {
+  local spec status
+  echo "install: installed harnesses detected: $(ready_harnesses "$(harnesses)")"
+  if [ -n "$EDITOR_SPEC" ]; then
+    resolve_spec "$EDITOR_SPEC" editor || return 1
+    set_ide_config "EDITOR" "$EDITOR_SPEC"
+  elif [ "$DO_PICK" -eq 1 ] && [ -t 0 ]; then
+    spec=$(prompt_slot editor "editor for the left pane" "nvim") || return "$?"
+    if [ -n "$spec" ]; then
+      set_ide_config "EDITOR" "$spec"
+    fi
+  fi
+  if [ -n "$TOP_SPEC" ]; then
+    resolve_spec "$TOP_SPEC" harness || return 1
+    set_ide_config "TOP" "$TOP_SPEC"
+  elif [ "$DO_PICK" -eq 1 ] && [ -t 0 ]; then
+    spec=$(prompt_slot harness "harness A for the top-right pane" "opencode") || return "$?"
+    if [ -n "$spec" ]; then
+      set_ide_config "TOP" "$spec"
+    fi
+  fi
+  if [ -n "$BOTTOM_SPEC" ]; then
+    resolve_spec "$BOTTOM_SPEC" harness || return 1
+    set_ide_config "BOTTOM" "$BOTTOM_SPEC"
+  elif [ "$DO_PICK" -eq 1 ] && [ -t 0 ]; then
+    spec=$(prompt_slot harness "harness B for the bottom-right pane" "omp") || return "$?"
+    if [ -n "$spec" ]; then
+      set_ide_config "BOTTOM" "$spec"
+    fi
+  fi
+}
+
 # ------------------------------------------------- opencode config assembly
 
 # write_opencode_config OUT: assemble opencode.jsonc. Every machine-specific
@@ -201,6 +395,7 @@ write_opencode_config() {
 # --------------------------------------------------------------------- main
 
 main() {
+  local status
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -h | --help)
@@ -220,6 +415,31 @@ main() {
       --no-nvim) DO_NVIM=0 ;;
       --no-tmux) DO_TMUX=0 ;;
       --no-path) DO_PATH=0 ;;
+      --no-pick) DO_PICK=0 ;;
+      --editor)
+        [ "$#" -ge 2 ] || { echo "install: --editor needs a value." >&2; return 1; }
+        EDITOR_SPEC="$2"
+        shift
+        ;;
+      --editor=*)
+        EDITOR_SPEC="${1#--editor=}"
+        ;;
+      --top)
+        [ "$#" -ge 2 ] || { echo "install: --top needs a value." >&2; return 1; }
+        TOP_SPEC="$2"
+        shift
+        ;;
+      --top=*)
+        TOP_SPEC="${1#--top=}"
+        ;;
+      --bottom)
+        [ "$#" -ge 2 ] || { echo "install: --bottom needs a value." >&2; return 1; }
+        BOTTOM_SPEC="$2"
+        shift
+        ;;
+      --bottom=*)
+        BOTTOM_SPEC="${1#--bottom=}"
+        ;;
       *)
         echo "install: unknown option $1" >&2
         usage >&2
@@ -250,12 +470,22 @@ main() {
     install_file "$SOURCE_DIR/config/tmux.conf" "$HOME/.tmux.conf" ""
   fi
 
-  # 3) nvim config
+  # 3) nvim config and user guide
   if [ "$DO_NVIM" -eq 1 ]; then
     install_file "$SOURCE_DIR/config/nvim/init.lua" "$NVIM_DIR/init.lua" ""
+    install_file "$SOURCE_DIR/docs/neovim-guide.md" "$GUIDE_DIR/neovim-guide.md" ""
   fi
 
-  # 4) opencode config, skills, maintenance
+  # 4) pane defaults: detect installed tools, honour flags, ask on a TTY
+  status=0
+  choose_defaults || status=$?
+  if [ "$status" -eq 2 ]; then
+    echo "install: pane default selection cancelled; runtime defaults apply."
+  elif [ "$status" -ne 0 ]; then
+    return "$status"
+  fi
+
+  # 5) opencode config, skills, maintenance
   if [ "$DO_OPENCODE" -eq 1 ]; then
     mkdir -p "$OPENCODE_DIR"
     TMP_JSON="$(mktemp "${TMPDIR:-/tmp}/ide-opencode.XXXXXX")"
@@ -267,7 +497,7 @@ main() {
     install_file "$SOURCE_DIR/opencode/package-lock.json" "$OPENCODE_DIR/package-lock.json" ""
   fi
 
-  # 5) mlx extras
+  # 6) mlx extras
   if [ "$WITH_MLX" -eq 1 ]; then
     install_file "$SOURCE_DIR/extras/mlx/mlx-serve" "$BIN_DIR/mlx-serve" "755"
     install_file "$SOURCE_DIR/extras/mlx/mlx-bench" "$BIN_DIR/mlx-bench" "755"

@@ -29,7 +29,7 @@ HEAD.
 | `opencode/opencode.jsonc` | `~/.config/opencode/opencode.jsonc` | Generated at install time. Cloudflare MCP servers always included; mlx provider only on Apple Silicon; persona-constitution and lummenna MCP servers only when their repositories exist under `$HOME`. |
 | `opencode/skills/` | `~/.config/opencode/skills/` | 12 opencode skills (Cloudflare platform, wrangler, agents SDK, durable objects, and more). |
 | `opencode/maintenance/compact-event-store.sh` | `~/.config/opencode/maintenance/` | Reclaims disk space in the opencode event store. Verifies integrity and projections before and after; refuses to run while opencode is running. |
-| `extras/mlx/` | opt-in, see below | `mlx-serve` (local OpenAI-compatible inference server), `mlx-bench`, and the detokenizer fix helpers. Apple Silicon + MLX only. |
+| `docs/neovim-guide.md` | `~/.local/share/ide-three-pane/docs/neovim-guide.md` | Complete neovim user guide. Open it inside neovim with `:IdeGuide`. || `extras/mlx/` | opt-in, see below | `mlx-serve` (local OpenAI-compatible inference server), `mlx-bench`, and the detokenizer fix helpers. Apple Silicon + MLX only. |
 
 ## Install
 
@@ -58,14 +58,36 @@ the packaged version are backed up to
 | `--bin-dir DIR` | Install the bin scripts into DIR (default `~/.local/bin`). |
 | `--with-mlx` | Also install the mlx extras. Requires an MLX venv at `~/.local/share/mlx-server/.venv` and an mlx-community model to be useful. |
 | `--no-opencode` | Skip the opencode config, skills, and maintenance scripts. |
-| `--no-nvim` | Skip the nvim config. |
+| `--no-nvim` | Skip the nvim config and the user guide. |
 | `--no-tmux` | Skip the tmux config. |
 | `--no-path` | Never touch any shell rc file. |
+| `--no-pick` | Skip the interactive pane selection; flags still apply. |
+| `--editor SPEC` | Default for the left pane, written to `~/.config/ide/config`. |
+| `--top SPEC` | Default for the top-right pane. |
+| `--bottom SPEC` | Default for the bottom-right pane. |
 
 The installer appends `~/.local/bin` to your PATH (zsh: `~/.zshrc`, bash:
 `~/.bashrc`) only when it is missing, using a marked block you can delete.
 Missing tmux, nvim, or opencode produce warnings with install hints, never
 failures.
+
+### Pane defaults: harness and editor detection
+
+The installer detects which agent harnesses and editors are installed
+(opencode, omp, hermes, claude, codex, gemini, aider, crush, goose; nvim,
+vim, helix, emacs, nano, micro), reports them, and asks which to use for the
+three panes. The choices are written to `~/.config/ide/config` as defaults
+the `ide` launcher reads on every start.
+
+- Interactive (terminal) installs prompt per pane: editor left, harness A
+  top right, harness B bottom right. Only installed tools are offered; `c`
+  enters a custom command such as `aider --model sonnet`; Enter keeps the
+  current default.
+- Non-interactive installs (piped, CI) skip the prompts and the runtime
+  defaults apply (`nvim` / `opencode` / `omp`), unless you pass flags:
+  `--editor nvim --top opencode --bottom hermes`.
+- `--no-pick` skips the prompts in an interactive run too; explicit flags
+  are still honoured.
 
 After installing: restart any running opencode so it reads the new config,
 then `tmux source-file ~/.tmux.conf`, then open a project with `ide [dir]`.
@@ -103,10 +125,22 @@ Only terminal programs run inside a pane.
 | `:IdeDiff` | Side-by-side diff of the current file against git HEAD |
 | `:IdeDiffOff` | Close the diff view |
 | `:IdeEditor` / `:IdeTop` / `:IdeBottom` | Jump to the other panes |
+| `:IdeGuide` | Open the bundled neovim user guide |
 | `-` | Back out of a file into the directory listing |
 
 Agent edits are re-read every second and on every pane re-entry, buffer
 switch, or typing pause. Unsaved local edits are never clobbered.
+
+## The neovim guide
+
+`docs/neovim-guide.md` is a complete neovim user guide: the survival card,
+every mode, motions, operators and text objects, search and replace with
+regular expressions, undo, buffers, windows, tabs, visual mode, registers,
+marks, the netrw file explorer, this setup's keys and commands, the
+agent-edit review workflow, cross-file search, and the help system. The
+installer puts it at
+`~/.local/share/ide-three-pane/docs/neovim-guide.md`, and neovim opens it
+with `:IdeGuide`.
 
 ## Machine-specific notes
 

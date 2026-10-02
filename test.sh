@@ -20,6 +20,7 @@ set -eu
 ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 FAILED=0
 TEST_HOME=""
+FLAG_HOME=""
 TEST_LOG=""
 
 fail() {
@@ -37,6 +38,9 @@ cleanup() {
   fi
   if [ -n "$TEST_HOME" ] && [ -d "$TEST_HOME" ]; then
     rm -rf "$TEST_HOME"
+  fi
+  if [ -n "$FLAG_HOME" ] && [ -d "$FLAG_HOME" ]; then
+    rm -rf "$FLAG_HOME"
   fi
 }
 trap cleanup EXIT
@@ -95,7 +99,7 @@ else
 fi
 
 echo "== 4. installed files =="
-INSTALLED=".local/bin/ide .local/bin/ide-focus .local/bin/ide-mouse .tmux.conf .config/nvim/init.lua .config/opencode/opencode.jsonc .config/opencode/package.json .config/opencode/package-lock.json .config/opencode/maintenance/compact-event-store.sh .config/opencode/skills/turnstile-spin/SKILL.md .config/opencode/skills/cloudflare/SKILL.md"
+INSTALLED=".local/bin/ide .local/bin/ide-focus .local/bin/ide-mouse .tmux.conf .config/nvim/init.lua .config/opencode/opencode.jsonc .config/opencode/package.json .config/opencode/package-lock.json .config/opencode/maintenance/compact-event-store.sh .local/share/ide-three-pane/docs/neovim-guide.md .config/opencode/skills/turnstile-spin/SKILL.md .config/opencode/skills/cloudflare/SKILL.md"
 for file in $INSTALLED; do
   if [ -f "$TEST_HOME/$file" ]; then
     ok "present: $file"
@@ -135,7 +139,80 @@ else
   fail "ide --tools failed under the temporary HOME"
 fi
 
-echo "== 7. idempotency =="
+echo "== 7. nvim loads the installed config =="
+if command -v nvim >/dev/null 2>&1; then
+  if HOME="$TEST_HOME" nvim --headless "+IdeGuide" "+qa" >"$TEST_LOG" 2>&1; then
+    if grep -qE "E[0-9]+:|Lua chunk" "$TEST_LOG"; then
+      fail "nvim reported errors loading the installed init.lua; log follows:"
+      cat "$TEST_LOG"
+    else
+      ok "nvim loads init.lua and IdeGuide without errors"
+    fi
+  else
+    fail "nvim --headless failed; log follows:"
+    cat "$TEST_LOG"
+  fi
+else
+  echo "skip: nvim not installed"
+fi
+
+echo "== 8. pane default flags write the ide launcher config =="
+FLAG_HOME="$(mktemp -d "${TMPDIR:-/tmp}/ide-test-flags.XXXXXX")"
+if HOME="$FLAG_HOME" bash "$ROOT/install.sh" --editor nvim --top omp --bottom hermes --no-path >"$TEST_LOG" 2>&1; then
+  ok "install.sh with pane default flags exit 0"
+  for expected in "EDITOR=nvim" "TOP=omp" "BOTTOM=hermes"; do
+    if grep -qx "$expected" "$FLAG_HOME/.config/ide/config"; then
+      ok "config contains $expected"
+    else
+      fail ".config/ide/config missing or wrong: expected $expected"
+      cat "$FLAG_HOME/.config/ide/config" 2>/dev/null
+    fi
+  done
+else
+  fail "install.sh with pane default flags exited non-zero; log follows:"
+  cat "$TEST_LOG"
+fi
+
+echo "== 9. interactive pane selection (expect, Enter keeps defaults) =="
+if command -v expect >/dev/null 2>&1; then
+  TTY_HOME="$(mktemp -d "${TMPDIR:-/tmp}/ide-test-tty.XXXXXX")"
+  EXPECT_SCRIPT="$(mktemp "${TMPDIR:-/tmp}/ide-test-expect.XXXXXX")"
+  cat > "$EXPECT_SCRIPT" <<EOF
+set timeout 30
+spawn env HOME=$TTY_HOME bash $ROOT/install.sh --no-path
+expect "editor for the left pane" { send "\r" }
+expect "top-right pane" { send "\r" }
+expect "bottom-right pane" { send "\r" }
+expect eof
+EOF
+  if expect "$EXPECT_SCRIPT" >"$TEST_LOG" 2>&1; then
+    ok "interactive install exit 0"
+    for expected in "EDITOR=nvim" "TOP=opencode" "BOTTOM=omp"; do
+      if grep -qx "$expected" "$TTY_HOME/.config/ide/config"; then
+        ok "config contains $expected"
+      else
+        fail ".config/ide/config missing or wrong: expected $expected"
+        cat "$TTY_HOME/.config/ide/config" 2>/dev/null
+      fi
+    done
+  else
+    fail "interactive install exited non-zero; log follows:"
+    cat "$TEST_LOG"
+  fi
+  rm -f "$EXPECT_SCRIPT"
+  rm -rf "$TTY_HOME"
+else
+  echo "skip: expect not installed, cannot test the interactive prompt path"
+fi
+
+echo "== 10. invalid pane default is rejected =="
+if HOME="$FLAG_HOME" bash "$ROOT/install.sh" --top no-such-harness --no-nvim --no-tmux --no-opencode --no-path >"$TEST_LOG" 2>&1; then
+  fail "--top no-such-harness should exit non-zero"
+else
+  ok "unknown --top value exits non-zero"
+fi
+
+echo "== 11. idempotency =="
 if HOME="$TEST_HOME" bash "$ROOT/install.sh" >"$TEST_LOG" 2>&1; then
   if grep -q "up to date" "$TEST_LOG"; then
     ok "second run exits 0 and reports up to date"
@@ -148,7 +225,7 @@ else
   cat "$TEST_LOG"
 fi
 
-echo "== 8. em dash scan (first-party files) =="
+echo "== 12. em dash scan (first-party files) =="
 # printf with octal escapes: bash 3.2 (macOS default) does not support \u escapes.
 EMDASH="$(printf '\342\200\224')"
 if grep -rl "$EMDASH" "$ROOT" 2>/dev/null | grep -v "/skills/" >"$TEST_LOG"; then

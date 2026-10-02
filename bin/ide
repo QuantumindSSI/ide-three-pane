@@ -48,6 +48,7 @@ harnesses() {
   printf '%s\n' \
     'opencode|opencode' \
     'omp|omp' \
+    'hermes|hermes' \
     'claude|claude' \
     'codex|codex' \
     'gemini|gemini' \

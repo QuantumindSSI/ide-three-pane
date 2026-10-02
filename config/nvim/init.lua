@@ -132,7 +132,7 @@ vim.api.nvim_create_user_command("IdeDiff", function()
   vim.cmd("diffthis")
   vim.cmd("wincmd p")
   vim.cmd("diffthis")
-end)
+end, {})
 
 -- Close the diff view and the scratch buffer.
 vim.api.nvim_create_user_command("IdeDiffOff", function()
@@ -143,4 +143,17 @@ vim.api.nvim_create_user_command("IdeDiffOff", function()
       vim.api.nvim_win_close(win, false)
     end
   end
-end)
+end, {})
+
+-- 4) User guide -------------------------------------------------------------
+
+-- Open the bundled neovim user guide inside the editor pane.
+-- Installed to ~/.local/share/ide-three-pane/docs/neovim-guide.md.
+vim.api.nvim_create_user_command("IdeGuide", function()
+  local guide = vim.fn.expand("~/.local/share/ide-three-pane/docs/neovim-guide.md")
+  if vim.fn.filereadable(guide) ~= 1 then
+    vim.notify("IdeGuide: guide not installed at " .. guide, vim.log.levels.WARN)
+    return
+  end
+  vim.cmd("edit " .. vim.fn.fnameescape(guide))
+end, { desc = "ide: open the neovim user guide" })
