@@ -1,0 +1,95 @@
+#!/bin/bash
+# ide-focus: jump to a pane in the ide layout by role, number, or tool name.
+#
+# Usage:
+#   ide-focus left|top-right|bottom-right|editor|1|2|3|<tool>|next|prev
+#
+# <tool> matches the pane title set by ide, e.g. nvim, hx, opencode, omp,
+# claude (exact match first, then substring). Targets the current window,
+# so it works from a shell prompt or from inside the editor via
+# :!ide-focus opencode  (neovim)  or the equivalent in your editor.
+
+set -eu
+
+usage() {
+  printf '%s\n' \
+    "usage: ide-focus [left|top-right|bottom-right|editor|1|2|3|<tool>|next|prev]" \
+    "" \
+    "  ide-focus left|editor    focus the editor (left, pane 1)" \
+    "  ide-focus top-right|2    focus harness A (top right, pane 2)" \
+    "  ide-focus bottom-right|3 focus harness B (bottom right, pane 3)" \
+    "  ide-focus <tool>         focus the pane running that tool" \
+    "  ide-focus next|prev      cycle panes" >&2
+}
+
+by_title() {
+  local want="$1" idx panes
+  panes=$(tmux list-panes -F '#{pane_index}	#{pane_title}	#{pane_current_command}')
+  idx=$(printf '%s\n' "$panes" \
+    | awk -F'\t' -v w="$want" 'tolower($2) == tolower(w) || tolower($3) == tolower(w) { print $1; exit }')
+  if [ -n "$idx" ]; then
+    printf ':.%s' "$idx"
+    return 0
+  fi
+  idx=$(printf '%s\n' "$panes" \
+    | awk -F'\t' -v w="$want" 'index(tolower($2), tolower(w)) > 0 || index(tolower($3), tolower(w)) > 0 { print $1; exit }')
+  if [ -n "$idx" ]; then
+    printf ':.%s' "$idx"
+    return 0
+  fi
+  return 1
+}
+
+target_for() {
+  case "$1" in
+    left | editor | 1)
+      printf '%s' ':.1'
+      ;;
+    top | top-right | topright | harness-a | 2)
+      printf '%s' ':.2'
+      ;;
+    bottom | bottom-right | bottomright | harness-b | 3)
+      printf '%s' ':.3'
+      ;;
+    next)
+      printf '%s' ':.+'
+      ;;
+    prev)
+      printf '%s' ':.-'
+      ;;
+    -h | --help | help)
+      usage
+      return 2
+      ;;
+    *)
+      by_title "$1" || {
+        printf "ide-focus: no pane named '%s' here:\n" "$1" >&2
+        tmux list-panes -F '  #{pane_index}: #{pane_title}' >&2
+        return 1
+      }
+      ;;
+  esac
+}
+
+main() {
+  local target status
+  if [ "$#" -ne 1 ]; then
+    usage
+    return 1
+  fi
+  if [ -z "${TMUX:-}" ] && [ -z "${TMUX_PANE:-}" ]; then
+    echo "ide-focus: not inside tmux" >&2
+    return 1
+  fi
+  target=$(target_for "$1")
+  status="$?"
+  if [ "$status" -eq 2 ]; then
+    return 0
+  fi
+  if [ "$status" -ne 0 ]; then
+    return "$status"
+  fi
+  tmux select-pane -t "$target"
+}
+
+main "$@"

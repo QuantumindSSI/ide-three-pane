@@ -1,0 +1,11 @@
+#!/bin/bash
+# ide-mouse: toggle tmux mouse mode (click/drag panes, scroll) on or off.
+set -eu
+
+if [ "$(tmux show-options -gv mouse 2>/dev/null)" = "on" ]; then
+  tmux set-option -g mouse off
+  tmux display-message "mouse: off (prefix + m to re-enable)" 2>/dev/null || :
+else
+  tmux set-option -g mouse on
+  tmux display-message "mouse: on (click a pane to focus it)" 2>/dev/null || :
+fi

@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""mlx-bench: measure TTFT, decode speed, and prefill behavior.
+
+Usage:
+  MODEL=<model-id> mlx-bench
+  MLX_BASE=http://127.0.0.1:8080 MODEL=<model-id> mlx-bench
+
+Runs three probes against POST /v1/chat/completions:
+  1. short prompt, streaming -> time to first content token (TTFT)
+  2. short prompt, 100 tokens  -> decode tokens/second
+  3. ~2k-token prompt, 5 tokens -> prefill TTFT on a long prompt
+Stdlib only.
+"""
+import json
+import os
+import sys
+import time
+import urllib.request
+
+BASE = os.environ.get("MLX_BASE", "http://127.0.0.1:8080")
+MODEL = os.environ.get("MODEL")
+if not MODEL:
+    sys.exit("MODEL env is required, e.g. MODEL=mlx-community/Qwen2.5-Coder-7B-Instruct-4bit mlx-bench")
+URL = BASE + "/v1/chat/completions"
+
+
+def post(payload, timeout=600):
+    req = urllib.request.Request(
+        URL, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def stream_first_content(payload):
+    """Return (ttft_seconds, wall_seconds, content_chunks)."""
+    t0 = time.time()
+    ttft = None
+    chunks = 0
+    with post(payload) as r:
+        for line in r:
+            line = line.decode().strip()
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            try:
+                c = json.loads(line[6:])["choices"][0]["delta"].get("content")
+            except Exception:
+                continue
+            if c:
+                chunks += 1
+                if ttft is None:
+                    ttft = time.time() - t0
+    return ttft, time.time() - t0, chunks
+
+
+def main():
+    short = "List 20 animals and one fact about each. Numbered, one per line."
+    base = {"model": MODEL, "temperature": 0}
+
+    p1 = dict(base, messages=[{"role": "user", "content": short}],
+              max_tokens=100, stream=True)
+    ttft, wall, chunks = stream_first_content(p1)
+    print(f"short-prompt TTFT: {ttft:.2f}s (wall {wall:.2f}s, {chunks} content chunks)")
+
+    p2 = dict(base, messages=[{"role": "user", "content": short}],
+              max_tokens=100, stream=False)
+    t0 = time.time()
+    with post(p2) as r:
+        body = json.load(r)
+    total = time.time() - t0
+    comp = body["usage"]["completion_tokens"]
+    prompt = body["usage"]["prompt_tokens"]
+    rate = comp / max(total - ttft, 0.01)
+    print(f"decode: prompt={prompt} completion={comp} wall={total:.2f}s -> {rate:.1f} tok/s")
+
+    filler = ("The quick brown fox jumps over the lazy dog near the riverbank at dawn. " * 120)
+    p3 = dict(base, messages=[{"role": "user", "content": filler + "\nReply with exactly: DONE"}],
+              max_tokens=5, stream=True)
+    t3, w3, c3 = stream_first_content(p3)
+    print(f"long-prompt (~2k tokens) TTFT: {t3:.1f}s (wall {w3:.1f}s)")
+
+
+if __name__ == "__main__":
+    main()

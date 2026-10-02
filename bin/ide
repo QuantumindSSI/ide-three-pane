@@ -1,0 +1,560 @@
+#!/bin/bash
+# ide: three-pane agentic workstation for software engineers.
+#
+# One code editor of your choice on the left, two agentic harnesses
+# stacked on the right, in any directory. One tmux session per directory.
+#
+# Usage:
+#   ide [dir]                              open (remembered/default tools)
+#   ide --pick [dir]                       choose tools interactively, remember
+#   ide --editor SPEC --top SPEC --bottom SPEC [dir]
+#                                          open with these tools, remember
+#   ide --forget [dir]                     forget remembered tools for dir
+#   ide --tools                            list known editors and harnesses
+#   ide --list                             list project directories
+#
+# A SPEC is a catalog name (see --tools) or a full command, e.g. "hx",
+# "hx .", "emacs -nw .", "codex", "aider --model sonnet". Only terminal
+# programs can run inside a pane; GUI editors open outside tmux instead.
+# Agent edits show up live in the editor pane (nvim: :IdeDiff shows the
+# change against git HEAD; vim: autoread + checktime).
+#
+# Precedence per slot: flag > IDE_EDITOR/IDE_TOP/IDE_BOTTOM env >
+# remembered choice > ~/.config/ide/config > builtins (nvim/opencode/omp).
+#
+# Movement: click any pane with the mouse; keyboard uses the tmux prefix
+# (Ctrl-b) then h/j/k/l (directional), N/E/O (editor/top/bottom), m
+# (toggle mouse), or Alt-h/j/k/l with no prefix. From a shell or inside
+# the editor: ide-focus <tool|1|2|3|next>.
+
+set -eu
+
+CONFIG_DIR="$HOME/.config/ide"
+CONFIG_FILE="$CONFIG_DIR/config"
+MEMORY_FILE="$CONFIG_DIR/dirs"
+MAX_DEPTH=4
+
+editors() {
+  printf '%s\n' \
+    'nvim|nvim .' \
+    'vim|vim .' \
+    'helix|hx .' \
+    'emacs|emacs -nw .' \
+    'nano|nano .' \
+    'micro|micro .'
+}
+
+harnesses() {
+  printf '%s\n' \
+    'opencode|opencode' \
+    'omp|omp' \
+    'claude|claude' \
+    'codex|codex' \
+    'gemini|gemini' \
+    'aider|aider' \
+    'crush|crush' \
+    'goose|goose'
+}
+
+discover() {
+  find "$HOME" -maxdepth "$MAX_DEPTH" \
+    \( -path "$HOME/Library" -o -path "$HOME/.Trash" -o \
+       -path "$HOME/node_modules" -o -path "$HOME/go/pkg" -o \
+       -path "$HOME/.cache" -o -path "$HOME/Movies" -o \
+       -path "$HOME/Music" -o -path "$HOME/Pictures" \) -prune -o \
+    -name .git \( -type d -o -type f \) -print 2>/dev/null \
+    | sed 's|/\.git$||' | sort -u
+}
+
+usage() {
+  printf '%s\n' \
+    "usage: ide [options] [name | path]" \
+    "" \
+    "  ide [dir]                 open the 3-pane session (remembered/defaults)" \
+    "  ide --pick [dir]          choose editor + 2 harnesses, remember them" \
+    "  ide --editor SPEC --top SPEC --bottom SPEC [dir]" \
+    "                            open with these tools, remember them" \
+    "  ide --forget [dir]        forget remembered tools for dir" \
+    "  ide --tools               list known editors and harnesses" \
+    "  ide --list                list every git repo discovered under ~" \
+    "" \
+    "SPEC is a catalog name from --tools or a command (\"hx .\", \"codex\")." \
+    "Layout: editor left, harness A top right, harness B bottom right." \
+    "Move: mouse click, or Ctrl-b then h/j/k/l, N/E/O, or ide-focus <tool>." \
+    "Live: agent edits appear in the editor pane; nvim adds :IdeDiff."
+}
+
+list_tools() {
+  local name cmd base status
+  printf 'editors (left pane):\n'
+  while IFS='|' read -r name cmd; do
+    [ -n "$name" ] || continue
+    base=$(printf '%s' "$cmd" | awk '{ print $1 }')
+    if command -v "$base" >/dev/null 2>&1; then status="ready"; else status="MISSING $base"; fi
+    printf '  %-8s %-14s %s\n' "$name" "$cmd" "$status"
+  done <<EOF
+$(editors)
+EOF
+  printf 'harnesses (right panes):\n'
+  while IFS='|' read -r name cmd; do
+    [ -n "$name" ] || continue
+    base=$(printf '%s' "$cmd" | awk '{ print $1 }')
+    if command -v "$base" >/dev/null 2>&1; then status="ready"; else status="MISSING $base"; fi
+    printf '  %-8s %-14s %s\n' "$name" "$cmd" "$status"
+  done <<EOF
+$(harnesses)
+EOF
+}
+
+# check_cmd "name|command": fail unless the binary exists.
+check_cmd() {
+  local cmd base name
+  name=$(printf '%s' "$1" | cut -d'|' -f1)
+  cmd=$(printf '%s' "$1" | cut -d'|' -f2-)
+  base=$(printf '%s' "$cmd" | awk '{ print $1 }')
+  if ! command -v "$base" >/dev/null 2>&1; then
+    echo "ide: '$name' needs '$base', which is not installed." >&2
+    echo "ide: run 'ide --tools' for alternatives, or install $base." >&2
+    return 1
+  fi
+}
+
+# resolve_spec SPEC editor|harness -> "name|command", validated.
+resolve_spec() {
+  local spec="$1" kind="$2" catalog line base
+  if [ "$kind" = editor ]; then catalog=$(editors); else catalog=$(harnesses); fi
+  line=$(printf '%s\n' "$catalog" | awk -F'|' -v s="$spec" '$1 == s { print; exit }')
+  if [ -n "$line" ]; then
+    check_cmd "$line" || return 1
+    printf '%s\n' "$line"
+    return 0
+  fi
+  base=$(printf '%s' "$spec" | awk '{ print $1 }')
+  if [ -z "$base" ]; then
+    echo "ide: empty $kind command." >&2
+    return 1
+  fi
+  if ! command -v "$base" >/dev/null 2>&1; then
+    echo "ide: $kind '$spec' needs '$base', which is not installed." >&2
+    echo "ide: run 'ide --tools' for known tools." >&2
+    return 1
+  fi
+  printf '%s|%s\n' "$base" "$spec"
+}
+
+config_value() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  awk -F= -v k="$1" '$1 == k { v=$0; sub(/^[^=]*=/, "", v); print v; exit }' "$CONFIG_FILE"
+}
+
+memory_lookup() {
+  [ -f "$MEMORY_FILE" ] || return 0
+  awk -F'\t' -v d="$1" '$1 == d { print; exit }' "$MEMORY_FILE"
+}
+
+memory_save() {
+  local tmp="$MEMORY_FILE.tmp.$$"
+  mkdir -p "$CONFIG_DIR"
+  if [ -f "$MEMORY_FILE" ]; then
+    awk -F'\t' -v d="$1" '$1 != d' "$MEMORY_FILE" >"$tmp"
+  else
+    : >"$tmp"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" >>"$tmp"
+  mv "$tmp" "$MEMORY_FILE"
+}
+
+memory_forget() {
+  local tmp="$MEMORY_FILE.tmp.$$"
+  [ -f "$MEMORY_FILE" ] || return 0
+  awk -F'\t' -v d="$1" '$1 != d' "$MEMORY_FILE" >"$tmp"
+  mv "$tmp" "$MEMORY_FILE"
+}
+
+session_name() {
+  local name
+  name=$(basename "$1")
+  name=$(printf '%s' "$name" | tr '.:' '__')
+  if [ -z "$name" ]; then
+    printf '%s\n' "ide: cannot name a session from $1" >&2
+    return 1
+  fi
+  printf '%s' "$name"
+}
+
+pick() {
+  local repos choice count n
+  repos=$(discover | awk -F/ '{ printf "%s\t%s\n", $NF, $0 }')
+  if [ -z "$repos" ]; then
+    echo "ide: no git repos found under $HOME" >&2
+    return 1
+  fi
+  if command -v fzf >/dev/null 2>&1; then
+    choice=$(printf '%s\n' "$repos" | fzf \
+      --prompt='project> ' \
+      --delimiter='\t' --with-nth=1,2 \
+      --preview='ls -la {2}' --preview-window=right:40% 2>/dev/null) \
+      || return 1
+    printf '%s\n' "$choice" | cut -f2
+    return 0
+  fi
+  # Menu goes to stderr: stdout carries only the chosen path,
+  # because callers use dir=$(pick).
+  printf '%s\n' "$repos" | awk -F'\t' \
+    '{ printf "%3d  %-26s %s\n", NR, $1, $2 }' >&2
+  printf '      (or type any directory path)\n' >&2
+  count=$(printf '%s\n' "$repos" | grep -c . || true)
+  printf 'number> ' >&2
+  read -r n || return 1
+  case "$n" in
+    '')
+      return 1
+      ;;
+    *[!0-9]*)
+      case "$n" in
+        '~'/*) n="$HOME/${n#~/}" ;;
+        '~') n="$HOME" ;;
+      esac
+      if [ -d "$n" ]; then
+        (cd "$n" 2>/dev/null && pwd -P)
+        return 0
+      fi
+      return 1
+      ;;
+  esac
+  if [ "$n" -lt 1 ] || [ "$n" -gt "$count" ]; then
+    echo "ide: no project number $n (1 to $count)" >&2
+    return 1
+  fi
+  printf '%s\n' "$repos" | sed -n "${n}p" | cut -f2
+}
+
+resolve_target() {
+  local arg="$1" matches count expanded abs
+  case "$arg" in
+    '~'/*)
+      expanded="$HOME/${arg#~/}"
+      ;;
+    '~')
+      expanded="$HOME"
+      ;;
+    *)
+      expanded="$arg"
+      ;;
+  esac
+  if [ -d "$expanded" ]; then
+    abs=$(cd "$expanded" 2>/dev/null && pwd -P) || return 1
+    printf '%s\n' "$abs"
+    return 0
+  fi
+  matches=$(discover | awk -F/ -v name="$arg" '$NF == name')
+  count=$(printf '%s\n' "$matches" | grep -c . || true)
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' "$matches"
+    return 0
+  fi
+  if [ "$count" -eq 0 ]; then
+    echo "ide: no project named $arg under $HOME (and not a directory)" >&2
+  else
+    echo "ide: several projects named $arg; pass a path instead:" >&2
+    printf '%s\n' "$matches" | sed 's/^/  /' >&2
+  fi
+  return 1
+}
+
+unique_session_name() {
+  local dir="$1" base="$2" candidate parent parent_base
+  candidate="$base"
+  if ! tmux has-session -t "$candidate" 2>/dev/null; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  if [ "$(tmux display-message -p -t "$candidate" -F '#{pane_current_path}' 2>/dev/null)" = "$dir" ]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  parent=$(dirname "$dir")
+  parent_base=$(basename "$parent" | tr '.:' '__')
+  candidate="${base}__${parent_base}"
+  if ! tmux has-session -t "$candidate" 2>/dev/null; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  if [ "$(tmux display-message -p -t "$candidate" -F '#{pane_current_path}' 2>/dev/null)" = "$dir" ]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  # shasum is absent on some Linux distros; cksum is POSIX and always there.
+  local dir_hash
+  if command -v shasum >/dev/null 2>&1; then
+    dir_hash=$(printf '%s' "$dir" | shasum -a 256 | cut -c1-6)
+  else
+    dir_hash=$(printf '%s' "$dir" | cksum | cut -c1-6)
+  fi
+  candidate="${base}__${dir_hash}"
+  printf '%s' "$candidate"
+}
+
+# choose_tool editor|harness catalog "current-name|current-command".
+choose_tool() {
+  local kind="$1" catalog="$2" current="$3"
+  local cur_name count ans i name cmd base status mark
+  cur_name=$(printf '%s' "$current" | cut -d'|' -f1)
+  count=$(printf '%s\n' "$catalog" | grep -c . )
+  # Menus go to stderr: stdout carries only the chosen "name|command"
+  # because determine_tools runs inside a command substitution.
+  printf '%s for this session (current: %s):\n' "$kind" "$cur_name" >&2
+  i=0
+  while IFS='|' read -r name cmd <&3; do
+    [ -n "$name" ] || continue
+    i=$((i + 1))
+    base=$(printf '%s' "$cmd" | awk '{ print $1 }')
+    if command -v "$base" >/dev/null 2>&1; then status="ready"; else status="MISSING: $base"; fi
+    if [ "$name" = "$cur_name" ]; then mark="*"; else mark=" "; fi
+    printf '%s %2d  %-8s %-14s %s\n' "$mark" "$i" "$name" "$cmd" "$status" >&2
+  done 3<<EOF
+$catalog
+EOF
+  printf 'c) custom command\n' >&2
+  printf 'choice [number, c, or Enter keeps %s]> ' "$cur_name" >&2
+  read -r ans || return 2
+  case "$ans" in
+    '')
+      check_cmd "$current" || return 1
+      printf '%s\n' "$current"
+      return 0
+      ;;
+    c | C)
+      printf 'command> ' >&2
+      read -r ans || return 2
+      resolve_spec "$ans" "$kind"
+      return "$?"
+      ;;
+    *[!0-9]*)
+      echo "ide: answer with a number, c, or Enter." >&2
+      return 1
+      ;;
+  esac
+  if [ "$ans" -lt 1 ] || [ "$ans" -gt "$count" ]; then
+    echo "ide: no $kind number $ans (1 to $count)" >&2
+    return 1
+  fi
+  ans=$(printf '%s\n' "$catalog" | sed -n "${ans}p")
+  check_cmd "$ans" || return 1
+  printf '%s\n' "$ans"
+}
+
+# slot_current editor|top|bottom editor|harness builtin-name -> name|command.
+slot_current() {
+  local slot="$1" kind="$2" builtin="$3" mem="$4"
+  local raw key
+  case "$slot" in
+    editor) raw="${IDE_EDITOR:-}"; key="EDITOR" ;;
+    top) raw="${IDE_TOP:-}"; key="TOP" ;;
+    bottom) raw="${IDE_BOTTOM:-}"; key="BOTTOM" ;;
+  esac
+  if [ -n "$raw" ]; then
+    resolve_spec "$raw" "$kind" || return 1
+    return 0
+  fi
+  if [ -n "$mem" ]; then
+    printf '%s\n' "$mem"
+    check_cmd "$mem" || return 1
+    return 0
+  fi
+  raw=$(config_value "$key")
+  if [ -n "$raw" ]; then
+    resolve_spec "$raw" "$kind" || return 1
+    return 0
+  fi
+  resolve_spec "$builtin" "$kind"
+}
+
+# determine_tools dir e_spec t_spec b_spec pick_flag -> 3 lines name|command.
+determine_tools() {
+  local dir="$1" e_spec="$2" t_spec="$3" b_spec="$4" pick_flag="$5"
+  local mem e_cur t_cur b_cur e_line t_line b_line
+  mem=$(memory_lookup "$dir")
+  if [ -n "$mem" ]; then
+    e_cur="$(printf '%s' "$mem" | cut -f2-3 | tr '\t' '|')"
+    t_cur="$(printf '%s' "$mem" | cut -f4-5 | tr '\t' '|')"
+    b_cur="$(printf '%s' "$mem" | cut -f6-7 | tr '\t' '|')"
+  else
+    e_cur=""; t_cur=""; b_cur=""
+  fi
+  if [ "$pick_flag" -eq 1 ]; then
+    e_cur=$(slot_current editor editor nvim "$e_cur") || return 1
+    t_cur=$(slot_current top harness opencode "$t_cur") || return 1
+    b_cur=$(slot_current bottom harness omp "$b_cur") || return 1
+    e_line=$(choose_tool editor "$(editors)" "$e_cur") || return "$?"
+    t_line=$(choose_tool "harness A (top right)" "$(harnesses)" "$t_cur") || return "$?"
+    b_line=$(choose_tool "harness B (bottom right)" "$(harnesses)" "$b_cur") || return "$?"
+  else
+    if [ -n "$e_spec" ]; then
+      e_line=$(resolve_spec "$e_spec" editor) || return 1
+    else
+      e_line=$(slot_current editor editor nvim "$e_cur") || return 1
+    fi
+    if [ -n "$t_spec" ]; then
+      t_line=$(resolve_spec "$t_spec" harness) || return 1
+    else
+      t_line=$(slot_current top harness opencode "$t_cur") || return 1
+    fi
+    if [ -n "$b_spec" ]; then
+      b_line=$(resolve_spec "$b_spec" harness) || return 1
+    else
+      b_line=$(slot_current bottom harness omp "$b_cur") || return 1
+    fi
+  fi
+  printf '%s\n%s\n%s\n' "$e_line" "$t_line" "$b_line"
+}
+
+create_session() {
+  local name="$1" dir="$2"
+  local e_name="$3" e_cmd="$4" t_name="$5" t_cmd="$6" b_name="$7" b_cmd="$8"
+  local editor_pane top_pane bottom_pane
+  tmux new-session -d -s "$name" -c "$dir" -n work
+  editor_pane=$(tmux list-panes -t "$name:work" -F '#{pane_id}')
+  top_pane=$(tmux split-window -h -t "$name:work" -c "$dir" \
+    -p 50 -P -F '#{pane_id}')
+  bottom_pane=$(tmux split-window -v -t "$top_pane" -c "$dir" \
+    -p 50 -P -F '#{pane_id}')
+  tmux select-pane -t "$editor_pane" -T "$e_name"
+  tmux select-pane -t "$top_pane" -T "$t_name"
+  tmux select-pane -t "$bottom_pane" -T "$b_name"
+  tmux set-option -t "$name:work" pane-border-status top
+  tmux send-keys -t "$editor_pane" "$e_cmd" 'C-m'
+  tmux send-keys -t "$top_pane" "$t_cmd" 'C-m'
+  tmux send-keys -t "$bottom_pane" "$b_cmd" 'C-m'
+  tmux select-pane -t "$editor_pane"
+}
+
+session_tools() {
+  tmux list-panes -t "$1" -F '#{pane_index}:#{pane_title}' 2>/dev/null | tr '\n' ' '
+}
+
+attach() {
+  local name="$1"
+  if [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "$name"
+  else
+    exec tmux attach-session -t "$name"
+  fi
+}
+
+main() {
+  local e_spec="" t_spec="" b_spec="" pick_flag=0 forget=0 dir_arg="" dir
+  local tools e_line t_line b_line e_name e_cmd t_name t_cmd b_name b_cmd
+  local name running status
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h | --help)
+        usage
+        return 0
+        ;;
+      --tools)
+        list_tools
+        return 0
+        ;;
+      --list)
+        discover
+        return 0
+        ;;
+      --pick)
+        pick_flag=1
+        ;;
+      --forget)
+        forget=1
+        ;;
+      --editor)
+        [ "$#" -ge 2 ] || { echo "ide: --editor needs a value." >&2; return 1; }
+        e_spec="$2"; shift
+        ;;
+      --editor=*)
+        e_spec="${1#--editor=}"
+        ;;
+      --top)
+        [ "$#" -ge 2 ] || { echo "ide: --top needs a value." >&2; return 1; }
+        t_spec="$2"; shift
+        ;;
+      --top=*)
+        t_spec="${1#--top=}"
+        ;;
+      --bottom)
+        [ "$#" -ge 2 ] || { echo "ide: --bottom needs a value." >&2; return 1; }
+        b_spec="$2"; shift
+        ;;
+      --bottom=*)
+        b_spec="${1#--bottom=}"
+        ;;
+      --)
+        shift
+        if [ "$#" -gt 0 ]; then dir_arg="$1"; shift; fi
+        break
+        ;;
+      -*)
+        echo "ide: unknown flag $1" >&2
+        usage >&2
+        return 1
+        ;;
+      *)
+        if [ -n "$dir_arg" ]; then
+          echo "ide: pass at most one directory." >&2
+          return 1
+        fi
+        dir_arg="$1"
+        ;;
+    esac
+    shift
+  done
+  if [ -z "$dir_arg" ]; then
+    dir=$(pick) || return 0
+  else
+    dir=$(resolve_target "$dir_arg") || return 1
+  fi
+  if [ "$forget" -eq 1 ]; then
+    memory_forget "$dir"
+    echo "ide: forgot remembered tools for $dir"
+    return 0
+  fi
+  status=0
+  tools=$(determine_tools "$dir" "$e_spec" "$t_spec" "$b_spec" "$pick_flag") || status=$?
+  if [ "$status" -eq 2 ]; then
+    echo "ide: cancelled."
+    return 0
+  fi
+  if [ "$status" -ne 0 ]; then
+    return "$status"
+  fi
+  e_line=$(printf '%s\n' "$tools" | sed -n '1p')
+  t_line=$(printf '%s\n' "$tools" | sed -n '2p')
+  b_line=$(printf '%s\n' "$tools" | sed -n '3p')
+  e_name=$(printf '%s' "$e_line" | cut -d'|' -f1)
+  e_cmd=$(printf '%s' "$e_line" | cut -d'|' -f2-)
+  t_name=$(printf '%s' "$t_line" | cut -d'|' -f1)
+  t_cmd=$(printf '%s' "$t_line" | cut -d'|' -f2-)
+  b_name=$(printf '%s' "$b_line" | cut -d'|' -f1)
+  b_cmd=$(printf '%s' "$b_line" | cut -d'|' -f2-)
+  if [ "$pick_flag" -eq 1 ] || [ -n "$e_spec$t_spec$b_spec" ]; then
+    memory_save "$dir" "$e_name" "$e_cmd" "$t_name" "$t_cmd" "$b_name" "$b_cmd"
+  fi
+  name=$(session_name "$dir") || return 1
+  name=$(unique_session_name "$dir" "$name")
+  if tmux has-session -t "$name" 2>/dev/null; then
+    running=$(session_tools "$name")
+    if [ "$pick_flag" -eq 1 ] || [ -n "$e_spec$t_spec$b_spec" ]; then
+      echo "ide: session $name already runs ($running); keeping it."
+      echo "ide: kill it first to rebuild with $e_name / $t_name / $b_name."
+    else
+      echo "ide: attaching to $name ($running)"
+    fi
+    attach "$name"
+    return 0
+  fi
+  create_session "$name" "$dir" "$e_name" "$e_cmd" "$t_name" "$t_cmd" "$b_name" "$b_cmd"
+  echo "ide: $name <- $e_name / $t_name / $b_name"
+  attach "$name"
+}
+
+main "$@"

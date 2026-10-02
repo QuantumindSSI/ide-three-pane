@@ -1,0 +1,32 @@
+#!/bin/zsh
+# mlx-serve: run mlx-lm OpenAI-compatible server for local inference.
+# Model: local LM Studio copy of Qwen2.5-Coder-7B MLX 4-bit (~4GB, fits 16GB
+# with headroom for agent prompts). Swapped down from the 14B on 23 Sep 2026
+# because agent-size prompts (16k+ tokens) caused multi-minute prefill and
+# Metal OOM crashes on 16GB. Override with MLX_MODEL env to serve anything
+# else, e.g.:
+#   MLX_MODEL="$HOME/.lmstudio/models/lmstudio-community/Qwen2.5-Coder-14B-Instruct-MLX-4bit" mlx-serve
+# Endpoint: http://127.0.0.1:8080/v1  (GET /v1/models, POST /v1/chat/completions)
+# Logs: ~/.local/share/mlx-server/mlx-server.log
+# Sampling: temp 0.7, top-p 0.8, min-p 0.05 = Qwen2.5 recommended. The server
+# default (temp 0.0, greedy) made every turn produce the identical generic
+# response on this model. Clients can still override per request.
+# Note: after any mlx-lm upgrade, re-run
+#   python3 ~/.local/share/mlx-server/apply-detok-fix.py
+# which re-applies the special-token detokenizer fix (stops the <|im_end|>
+# leak), then restart this server.
+set -u
+MODEL="${MLX_MODEL:-/Users/oluwaferanmi/.lmstudio/models/mlx-community/Qwen2.5-Coder-7B-Instruct-4bit}"
+HOST="${MLX_HOST:-127.0.0.1}"
+PORT="${MLX_PORT:-8080}"
+VENV_PY="$HOME/.local/share/mlx-server/.venv/bin/python"
+LOG_DIR="$HOME/.local/share/mlx-server"
+LOG="$LOG_DIR/mlx-server.log"
+mkdir -p "$LOG_DIR"
+if [[ ! -x "$VENV_PY" ]]; then
+  echo "mlx-serve: venv python not found at $VENV_PY" >&2
+  exit 1
+fi
+echo "mlx-serve: starting model=$MODEL host=$HOST port=$PORT" >>"$LOG"
+exec "$VENV_PY" -m mlx_lm server --model "$MODEL" --host "$HOST" --port "$PORT" \
+  --temp 0.7 --top-p 0.8 --min-p 0.05 --log-level INFO >>"$LOG" 2>&1
